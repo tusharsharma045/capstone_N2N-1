@@ -1,0 +1,86 @@
+// ============================================================================
+// Memory.hdl — The Data Memory of the Hack Computer
+// ============================================================================
+// This chip combines three memory-mapped devices into one unified address space:
+//
+//   Address Range       | Device     | Size       | Purpose
+//   --------------------|------------|------------|----------------------------
+//   0x0000 – 0x3FFF     | RAM16K     | 16K words  | General-purpose data memory
+//   0x4000 – 0x5FFF     | Screen     | 8K words   | Display (memory-mapped I/O)
+//   0x6000              | Keyboard   | 1 word     | Keyboard input (read-only)
+//
+// How addressing works:
+//   The 15-bit address is split using the top two bits:
+//     address[14] = 0              → RAM16K    (addresses 0–16383)
+//     address[14] = 1, [13] = 0   → Screen    (addresses 16384–24575)
+//     address[14] = 1, [13] = 1   → Keyboard  (address 24576)
+//
+// The Screen and Keyboard are memory-mapped I/O devices:
+//   • Writing to the Screen memory changes pixels on the display.
+//   • Reading from the Keyboard register returns the key currently pressed.
+// ============================================================================
+
+CHIP Memory {
+    IN in[16],        // 16-bit data input (value to write)
+       load,          // Write enable: 1 = write, 0 = read only
+       address[15];   // 15-bit address (can address up to 32K words)
+    OUT out[16];      // 16-bit data output (value at the given address)
+
+    PARTS:
+
+    // =====================================================================
+    // STEP 1: Route the 'load' signal to the correct memory device
+    // =====================================================================
+    // We use DMux4Way to send the load signal to exactly one device,
+    // based on the top two address bits (address[13..14]).
+    //
+    // DMux4Way sel mapping (sel = {address[14], address[13]}):
+    //   sel=00 (a) → RAM  (address[14]=0, address[13]=0)
+    //   sel=01 (b) → RAM  (address[14]=0, address[13]=1)
+    //   sel=10 (c) → Screen
+    //   sel=11 (d) → Keyboard (but Keyboard is read-only, so we ignore this)
+
+    DMux4Way(in=load, sel=address[13..14],
+             a=loadRAM1,     // Lower half of RAM range
+             b=loadRAM2,     // Upper half of RAM range
+             c=loadScreen,   // Screen memory
+             d=loadKB);      // Keyboard (ignored — it's read-only)
+
+    // Both loadRAM1 and loadRAM2 target the RAM, so combine them.
+    // When address[14]=0, the address falls within RAM regardless of address[13].
+    Or(a=loadRAM1, b=loadRAM2, out=loadRAM);
+
+    // =====================================================================
+    // STEP 2: Connect each memory device
+    // =====================================================================
+
+    // --- RAM16K: 16,384 words of general-purpose data memory ---
+    // Uses the lower 14 bits of the address (address[0..13]).
+    // This is where variables, arrays, stack, and heap live.
+    RAM16K(in=in, load=loadRAM, address=address[0..13], out=ramOut);
+
+    // --- Screen: 8,192 words of display memory ---
+    // Uses the lower 13 bits of the address (address[0..12]).
+    // Each bit in this memory maps to a pixel on the 256×512 display.
+    // Writing a 1-bit turns the pixel black; 0 turns it white.
+    Screen(in=in, load=loadScreen, address=address[0..12], out=screenOut);
+
+    // --- Keyboard: single read-only register ---
+    // Returns the scan code of the currently pressed key (0 if no key).
+    // No address or load input needed — it's a single hardware register.
+    Keyboard(out=kbOut);
+
+    // =====================================================================
+    // STEP 3: Select the correct output using address bits
+    // =====================================================================
+    // We use Mux4Way16 to pick which device's output to return,
+    // based on the same top-two-bit addressing scheme.
+    //
+    // sel=00 or 01 → RAM output  (that's why ramOut appears twice, at a and b)
+    // sel=10       → Screen output
+    // sel=11       → Keyboard output
+
+    Mux4Way16(a=ramOut, b=ramOut,
+              c=screenOut, d=kbOut,
+              sel=address[13..14], out=out);
+}

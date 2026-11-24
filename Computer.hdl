@@ -1,0 +1,91 @@
+// ============================================================================
+// Computer.hdl — The Top-Level Hack Computer
+// ============================================================================
+// This is the complete Hack computer, assembled from three main components:
+//
+//   ┌─────────────────────────────────────────────────────────┐
+//   │                    HACK COMPUTER                        │
+//   │                                                         │
+//   │  ┌──────────┐    instruction    ┌──────────┐            │
+//   │  │          │ ───────────────▶  │          │            │
+//   │  │  ROM32K  │                   │   CPU    │            │
+//   │  │ (Instr.  │  ◀─── pc ──────  │          │            │
+//   │  │  Memory) │                   │          │            │
+//   │  └──────────┘                   │          │            │
+//   │                                 │          │            │
+//   │  ┌──────────┐    memOut         │          │            │
+//   │  │          │ ───────────────▶  │          │            │
+//   │  │  Memory  │                   │          │            │
+//   │  │ (RAM +   │  ◀─── outM ────  │          │            │
+//   │  │  Screen +│  ◀─── writeM ──  │          │            │
+//   │  │  Keybd)  │  ◀─── addressM   │          │            │
+//   │  └──────────┘                   └──────────┘            │
+//   │                                      ▲                  │
+//   │                                      │                  │
+//   │                                    reset                │
+//   └──────────────────────────────────────────────────────────┘
+//
+// How it works (the fetch-execute cycle):
+//   1. The CPU outputs 'pc' — the address of the next instruction.
+//   2. ROM32K reads that address and outputs the instruction.
+//   3. The CPU receives the instruction AND the value from Memory (memOut).
+//   4. The CPU executes the instruction:
+//      • It may compute a value (outM) and write it to Memory (writeM=1).
+//      • It updates the program counter (pc) — either increment or jump.
+//   5. This cycle repeats every clock tick.
+//
+// The 'reset' input:
+//   • reset=1 → PC is set to 0, so the program restarts from the beginning.
+//   • reset=0 → normal execution continues.
+// ============================================================================
+
+CHIP Computer {
+    IN reset;   // 1 = restart program from address 0, 0 = keep running
+
+    PARTS:
+
+    // =====================================================================
+    // Instruction Memory (ROM)
+    // =====================================================================
+    // The ROM32K is a read-only memory that stores the program.
+    // It takes the program counter (pc) as an address and outputs
+    // the 16-bit instruction at that address.
+    // The program is loaded into the ROM before the computer starts.
+
+    ROM32K(address=pc, out=instruction);
+
+    // =====================================================================
+    // CPU — Central Processing Unit
+    // =====================================================================
+    // The CPU is the brain of the computer. Each clock cycle, it:
+    //   • Reads an instruction from the ROM
+    //   • Reads a value from Memory (memOut = RAM[addressM])
+    //   • Executes the instruction
+    //   • Outputs: the result (outM), whether to write (writeM),
+    //     the target address (addressM), and the next PC value (pc)
+
+    CPU(inM=memOut,               // Data read from memory
+        instruction=instruction,  // Current instruction from ROM
+        reset=reset,              // Reset signal
+        outM=outM,                // Computed value to write to memory
+        writeM=writeM,            // Should we write outM to RAM[addressM]?
+        addressM=addressM,        // Memory address to read/write
+        pc=pc);                   // Address of the next instruction
+
+    // =====================================================================
+    // Data Memory (RAM + Screen + Keyboard)
+    // =====================================================================
+    // The Memory chip unifies:
+    //   • RAM16K (general-purpose storage: variables, stack, heap)
+    //   • Screen (memory-mapped display)
+    //   • Keyboard (memory-mapped input)
+    //
+    // The CPU writes to memory when writeM=1.
+    // The memory always outputs the value at addressM (memOut),
+    // which the CPU uses as 'inM' on the next cycle.
+
+    Memory(in=outM,               // Data to write (from CPU)
+           load=writeM,           // Write enable (from CPU)
+           address=addressM,      // Which address to access (from CPU)
+           out=memOut);           // Data read from memory (fed back to CPU)
+}

@@ -1,0 +1,178 @@
+// ============================================================================
+// CPU.hdl — The Central Processing Unit of the Hack Computer
+// ============================================================================
+// The CPU fetches an instruction and executes it. It interacts with memory
+// via inM (data read from RAM[A]) and outM (data to write to RAM[A]).
+//
+// The Hack CPU handles two kinds of instructions:
+//   • A-instruction (instruction[15] = 0): Sets the A register to a 15-bit
+//     constant value. Used to select memory addresses or load constants.
+//     Binary format: 0vvv vvvv vvvv vvvv   (v = value bits)
+//
+//   • C-instruction (instruction[15] = 1): Performs a computation using the
+//     ALU and optionally stores the result and/or jumps.
+//     Binary format: 111a cccc ccdd djjj
+//       a      = instruction[12]    — selects A register (0) or M/RAM[A] (1)
+//       cccccc = instruction[11..6] — ALU control bits (what to compute)
+//       ddd    = instruction[5..3]  — destination bits:
+//                  d1 = instruction[5] — store result in A register
+//                  d2 = instruction[4] — store result in D register
+//                  d3 = instruction[3] — store result in Memory (RAM[A])
+//       jjj    = instruction[2..0]  — jump condition bits:
+//                  j1 = instruction[2] — jump if ALU output < 0
+//                  j2 = instruction[1] — jump if ALU output = 0
+//                  j3 = instruction[0] — jump if ALU output > 0
+// ============================================================================
+
+CHIP CPU {
+    IN  inM[16],         // M value input  (M = contents of RAM[A])
+        instruction[16], // Instruction for execution
+        reset;           // Signals whether to restart current
+                         // program (reset==1) or continue executing
+                         // the current program (reset==0).
+
+    OUT outM[16],        // M value output
+        writeM,          // Write to M? 
+        addressM[15],    // Address in data memory (of M)
+        pc[15];          // Address of next instruction
+
+    PARTS:
+
+    // =====================================================================
+    // STEP 1: Instruction Decode — determine instruction type
+    // =====================================================================
+    // The most-significant bit (instruction[15]) tells us the type:
+    //   0 → A-instruction (load a constant into the A register)
+    //   1 → C-instruction (compute something with the ALU)
+    // We create two helper signals: isAinst and isCinst.
+
+    Not(in=instruction[15], out=isAinst);   // isAinst = 1 when A-instruction
+    Not(in=isAinst, out=isCinst);           // isCinst = 1 when C-instruction
+
+    // =====================================================================
+    // STEP 2: A Register — what value goes into it?
+    // =====================================================================
+    // The A register can be loaded from two sources:
+    //   • A-instruction: load the 16-bit instruction value directly (a constant)
+    //   • C-instruction with d1=1: load the ALU output into A
+    //
+    // We use a Mux16 to choose between these two sources:
+    //   sel=0 → use the raw instruction (A-instruction value)
+    //   sel=1 → use the ALU output (C-instruction storing to A)
+
+    And(a=isCinst, b=instruction[5], out=aluToA);    // C-inst AND d1=1?
+    Mux16(a=instruction, b=aluOut, sel=aluToA, out=aInput);
+
+    // Load the A register when:
+    //   • It's an A-instruction (always load the constant), OR
+    //   • It's a C-instruction that stores to A (d1=1)
+
+    Or(a=isAinst, b=aluToA, out=loadA);
+    ARegister(in=aInput, load=loadA, out=aOut, out[0..14]=addressM);
+    // Note: addressM outputs the lower 15 bits of A — the memory address
+
+    // =====================================================================
+    // STEP 3: Select ALU y-input — use A register or Memory (inM)?
+    // =====================================================================
+    // The 'a-bit' (instruction[12]) determines the ALU's second input:
+    //   a=0 → use the A register value (for computations like D+A)
+    //   a=1 → use inM, the value from RAM[A] (for computations like D+M)
+    //
+    // IMPORTANT: We should only select inM when it's actually a C-instruction.
+    // For A-instructions, instruction[12] might be 1 (it's just a data bit),
+    // but we should still use A register output, not memory.
+
+    And(a=isCinst, b=instruction[12], out=selM);     // Only use M if C-inst
+    Mux16(a=aOut, b=inM, sel=selM, out=amInput);
+
+    // =====================================================================
+    // STEP 4: D Register — load ALU output when d2=1
+    // =====================================================================
+    // The D register holds one of the ALU's operands.
+    // It is loaded with the ALU output only when:
+    //   • It's a C-instruction, AND
+    //   • The d2 destination bit (instruction[4]) is 1
+
+    And(a=isCinst, b=instruction[4], out=loadD);
+    DRegister(in=aluOut, load=loadD, out=dOut);
+
+    // =====================================================================
+    // STEP 5: ALU — the heart of computation
+    // =====================================================================
+    // The ALU performs the actual computation specified by the c-bits.
+    // Inputs:
+    //   x = D register (always)
+    //   y = A or M (selected in Step 3)
+    //
+    // The six control bits (instruction[11..6]) map directly to ALU pins:
+    //   zx = instruction[11]  — zero the x input
+    //   nx = instruction[10]  — negate the x input
+    //   zy = instruction[9]   — zero the y input
+    //   ny = instruction[8]   — negate the y input
+    //   f  = instruction[7]   — function select: 1=add, 0=and
+    //   no = instruction[6]   — negate the output
+    //
+    // Outputs:
+    //   out    → the 16-bit result (goes to outM and feeds back to registers)
+    //   zr     → 1 if output is zero
+    //   ng     → 1 if output is negative (bit 15 = 1)
+
+    ALU(x=dOut, y=amInput,
+        zx=instruction[11], nx=instruction[10],
+        zy=instruction[9],  ny=instruction[8],
+        f=instruction[7],   no=instruction[6],
+        out=aluOut,          // Internal feedback (to A and D registers)
+        out=outM,            // Output to memory
+        zr=zrOut,            // Is ALU output == 0?
+        ng=ngOut);           // Is ALU output < 0?
+
+    // =====================================================================
+    // STEP 6: writeM — should we write to memory?
+    // =====================================================================
+    // Write to memory (RAM[A]) only when it's a C-instruction
+    // AND the d3 destination bit (instruction[3]) is 1.
+
+    And(a=isCinst, b=instruction[3], out=writeM);
+
+    // =====================================================================
+    // STEP 7: Jump Logic — should the PC jump to address A?
+    // =====================================================================
+    // The three jump bits (j1, j2, j3) specify when to jump:
+    //   j1 = instruction[2] → jump if ALU output is NEGATIVE  (out < 0)
+    //   j2 = instruction[1] → jump if ALU output is ZERO      (out = 0)
+    //   j3 = instruction[0] → jump if ALU output is POSITIVE  (out > 0)
+    //
+    // We compare these bits against the ALU's status outputs (zr, ng).
+
+    // First, determine if ALU output is positive:
+    // positive means NOT negative AND NOT zero
+    Or(a=zrOut, b=ngOut, out=notPos);
+    Not(in=notPos, out=isPos);
+
+    // Check each jump condition individually:
+    And(a=instruction[2], b=ngOut, out=jlt);   // j1 AND negative → JLT
+    And(a=instruction[1], b=zrOut, out=jeq);   // j2 AND zero     → JEQ
+    And(a=instruction[0], b=isPos, out=jgt);   // j3 AND positive → JGT
+
+    // Combine: jump if ANY condition is satisfied
+    Or(a=jlt, b=jeq, out=jle);
+    Or(a=jle, b=jgt, out=jumpIf);
+
+    // Only actually jump if this is a C-instruction
+    // (A-instructions should never trigger a jump, even if their
+    //  lower bits happen to match a jump pattern)
+    And(a=isCinst, b=jumpIf, out=doJump);
+
+    // =====================================================================
+    // STEP 8: Program Counter (PC) — what instruction to fetch next?
+    // =====================================================================
+    // The PC determines the next instruction address:
+    //   • reset=1  → PC = 0           (restart the program)
+    //   • doJump=1 → PC = A register  (jump to address in A)
+    //   • otherwise → PC = PC + 1     (fetch next sequential instruction)
+    //
+    // Priority: reset > load (jump) > inc
+    // The built-in PC chip handles this priority automatically.
+
+    PC(in=aOut, load=doJump, inc=true, reset=reset, out[0..14]=pc);
+}
